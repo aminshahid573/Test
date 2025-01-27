@@ -1,11 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { doc, onSnapshot, updateDoc } from 'firebase/firestore';
+import { doc, onSnapshot, updateDoc, getDoc, deleteDoc } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useAuth } from '../contexts/AuthContext';
 import { GameBoard } from '../components/GameBoard';
 import { Button } from '../components/Button';
-import { ArrowLeft, Copy, Share2 } from 'lucide-react';
+import { ArrowLeft, Copy, Share2, Trash2 } from 'lucide-react';
 
 interface Player {
   id: string;
@@ -18,7 +18,7 @@ interface GameState {
   board: string[];
   currentPlayer: string;
   status: 'waiting' | 'in_progress' | 'completed';
-  winner?: string;
+  winner: string | null;
 }
 
 interface Room {
@@ -28,6 +28,7 @@ interface Room {
     isPrivate: boolean;
     maxPlayers: number;
   };
+  ownerId: string;
 }
 
 const winningCombinations = [
@@ -42,6 +43,7 @@ export function Game() {
   const { user } = useAuth();
   const [room, setRoom] = useState<Room | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -67,26 +69,68 @@ export function Game() {
           board: Array(9).fill(''),
           currentPlayer: user.uid,
           status: 'in_progress',
+          winner: null
         },
         settings: {
           isPrivate: true,
           maxPlayers: 2,
         },
+        ownerId: user.uid
       });
       setLoading(false);
       return;
     }
 
-    const unsubscribe = onSnapshot(doc(db, 'rooms', roomId), (doc) => {
-      if (doc.exists()) {
-        setRoom(doc.data() as Room);
-      } else {
-        navigate('/');
-      }
-      setLoading(false);
-    });
+    const joinRoom = async () => {
+      try {
+        const roomRef = doc(db, 'rooms', roomId);
+        const roomDoc = await getDoc(roomRef);
+        
+        if (!roomDoc.exists()) {
+          setError('Room not found');
+          return;
+        }
 
-    return () => unsubscribe();
+        const roomData = roomDoc.data() as Room;
+        
+        // Check if user is already in the room
+        if (!roomData.players.some(p => p.id === user.uid)) {
+          // Join only if there's space
+          if (roomData.players.length < roomData.settings.maxPlayers) {
+            await updateDoc(roomRef, {
+              players: [...roomData.players, {
+                id: user.uid,
+                name: user.email?.split('@')[0] || `Player ${Math.floor(Math.random() * 1000)}`,
+                symbol: 'O',
+                ready: true
+              }],
+              'gameState.status': 'in_progress',
+              'gameState.winner': null
+            });
+          } else {
+            setError('Room is full');
+          }
+        }
+
+        // Set up real-time updates
+        const unsubscribe = onSnapshot(roomRef, (doc) => {
+          if (doc.exists()) {
+            setRoom(doc.data() as Room);
+            setLoading(false);
+          } else {
+            setError('Room was deleted');
+            navigate('/');
+          }
+        });
+
+        return () => unsubscribe();
+      } catch (error) {
+        console.error('Error joining room:', error);
+        setError('Failed to join room');
+      }
+    };
+
+    joinRoom();
   }, [roomId, user, navigate]);
 
   const checkWinner = (board: string[]): string | null => {
@@ -129,7 +173,7 @@ export function Game() {
             board: newBoard,
             currentPlayer: 'bot',
             status: winner || isDraw ? 'completed' : 'in_progress',
-            winner: winner ? user.uid : undefined
+            winner: winner ? user.uid : null
           },
         };
       });
@@ -155,7 +199,7 @@ export function Game() {
                   board: boardWithBotMove,
                   currentPlayer: user.uid,
                   status: botWinner || isBotDraw ? 'completed' : 'in_progress',
-                  winner: botWinner ? 'bot' : undefined
+                  winner: botWinner ? 'bot' : null
                 },
               };
             });
@@ -164,16 +208,37 @@ export function Game() {
       }
     } else {
       // Handle multiplayer game
-      const winner = checkWinner(newBoard);
-      const isDraw = !winner && checkDraw(newBoard);
-      const nextPlayer = room.players.find(p => p.id !== currentPlayer)?.id;
+      try {
+        const winner = checkWinner(newBoard);
+        const isDraw = !winner && checkDraw(newBoard);
+        const nextPlayer = room.players.find(p => p.id !== currentPlayer)?.id || currentPlayer;
 
-      await updateDoc(doc(db, 'rooms', roomId), {
-        'gameState.board': newBoard,
-        'gameState.currentPlayer': nextPlayer,
-        'gameState.status': winner || isDraw ? 'completed' : 'in_progress',
-        'gameState.winner': winner ? user.uid : undefined
-      });
+        const updates = {
+          'gameState.board': newBoard,
+          'gameState.currentPlayer': nextPlayer,
+          'gameState.status': winner || isDraw ? 'completed' : 'in_progress',
+          'gameState.winner': winner ? user.uid : null
+        };
+
+        await updateDoc(doc(db, 'rooms', roomId), updates);
+      } catch (error) {
+        console.error('Error updating game:', error);
+      }
+    }
+  };
+
+  const deleteRoom = async () => {
+    if (!roomId || !user || roomId === 'bot') return;
+    try {
+      const roomRef = doc(db, 'rooms', roomId);
+      const roomDoc = await getDoc(roomRef);
+      
+      if (roomDoc.exists() && roomDoc.data().ownerId === user.uid) {
+        await deleteDoc(roomRef);
+        navigate('/');
+      }
+    } catch (error) {
+      console.error('Error deleting room:', error);
     }
   };
 
@@ -187,7 +252,9 @@ export function Game() {
 
   const shareRoom = async () => {
     if (roomId) {
-      const shareUrl = `${window.location.origin}/game/${roomId}`;
+      // Use absolute URL with window.location.origin
+      const shareUrl = new URL(`/game/${roomId}`, window.location.origin).toString();
+      
       try {
         if (navigator.share) {
           await navigator.share({
@@ -196,10 +263,13 @@ export function Game() {
             url: shareUrl
           });
         } else {
-          throw new Error('Web Share API not supported');
+          // Fall back to copying to clipboard
+          await navigator.clipboard.writeText(shareUrl);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
         }
       } catch (error) {
-        // Fall back to copying to clipboard
+        // If sharing fails, copy to clipboard
         try {
           await navigator.clipboard.writeText(shareUrl);
           setCopied(true);
@@ -219,6 +289,17 @@ export function Game() {
     );
   }
 
+  if (error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center space-y-4">
+          <div className="text-red-400">{error}</div>
+          <Button onClick={() => navigate('/')}>Back to Home</Button>
+        </div>
+      </div>
+    );
+  }
+
   if (!room) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -233,6 +314,7 @@ export function Game() {
   const isDraw = room.gameState.status === 'completed' && !winner;
   const isWinner = winner === user?.uid;
   const isLoser = winner && winner !== user?.uid;
+  const isOwner = room.ownerId === user?.uid;
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-4">
@@ -261,6 +343,15 @@ export function Game() {
               >
                 <Share2 className="w-5 h-5" />
               </Button>
+              {isOwner && (
+                <Button
+                  variant="danger"
+                  onClick={deleteRoom}
+                  className="!px-3"
+                >
+                  <Trash2 className="w-5 h-5" />
+                </Button>
+              )}
             </div>
           )}
         </div>
